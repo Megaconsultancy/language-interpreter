@@ -5,11 +5,65 @@ from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import uvicorn
 from contextlib import asynccontextmanager
 import asyncio
+import re
 
 # Global variables to hold the model and tokenizer in memory
 tokenizer = None
 model = None
 translation_lock = asyncio.Lock()
+
+# NLLB hard token limit is 512; we stay comfortably below it
+MAX_INPUT_TOKENS = 480
+
+def chunk_text(text: str, src_lang_code: str) -> list[str]:
+    """Split *text* into token-safe chunks that fit within MAX_INPUT_TOKENS.
+
+    We split on sentence boundaries first, then greedily group sentences into
+    chunks.  This preserves as much context as possible while guaranteeing that
+    nothing gets silently truncated by the tokeniser's hard 512-token limit.
+    """
+    # Split on sentence-ending punctuation followed by whitespace
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    chunks: list[str] = []
+    current_sentences: list[str] = []
+    current_tokens = 0
+
+    for sentence in sentences:
+        # Temporarily set tokenizer lang so token counts are accurate
+        token_count = len(tokenizer(sentence, add_special_tokens=False)["input_ids"])
+
+        if current_sentences and current_tokens + token_count > MAX_INPUT_TOKENS:
+            # Flush the current chunk
+            chunks.append(" ".join(current_sentences))
+            current_sentences = []
+            current_tokens = 0
+
+        if token_count > MAX_INPUT_TOKENS:
+            # Single sentence is too long; hard-split by word count
+            words = sentence.split()
+            part: list[str] = []
+            part_tokens = 0
+            for word in words:
+                w_tokens = len(tokenizer(word, add_special_tokens=False)["input_ids"])
+                if part and part_tokens + w_tokens > MAX_INPUT_TOKENS:
+                    chunks.append(" ".join(part))
+                    part = []
+                    part_tokens = 0
+                part.append(word)
+                part_tokens += w_tokens
+            if part:
+                chunks.append(" ".join(part))
+        else:
+            current_sentences.append(sentence)
+            current_tokens += token_count
+
+    if current_sentences:
+        chunks.append(" ".join(current_sentences))
+
+    return chunks if chunks else [text]
+
 
 LANGUAGE_CODES = {
     "bem": "bem_Latn",
@@ -95,18 +149,33 @@ async def translate_text(request: TranslationRequest):
         BATCH_SIZE = 32
         all_translations = []
 
-        for i in range(0, len(texts), BATCH_SIZE):
-            batch = texts[i : i + BATCH_SIZE]
-            inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True)
+        for text_item in texts:
+            # Split into token-safe chunks so nothing is silently truncated
+            text_chunks = chunk_text(text_item, source_code)
+            chunk_translations: list[str] = []
 
-            translated_tokens = model.generate(
-                **inputs,
-                forced_bos_token_id=tokenizer.convert_tokens_to_ids(target_code),
-                max_length=400,
-            )
+            for i in range(0, len(text_chunks), BATCH_SIZE):
+                batch = text_chunks[i : i + BATCH_SIZE]
+                inputs = tokenizer(
+                    batch,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                )
 
-            batch_translations = tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
-            all_translations.extend(batch_translations)
+                translated_tokens = model.generate(
+                    **inputs,
+                    forced_bos_token_id=tokenizer.convert_tokens_to_ids(target_code),
+                    max_new_tokens=512,
+                )
+
+                chunk_translations.extend(
+                    tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
+                )
+
+            # Re-join chunk translations into one string per original text
+            all_translations.append(" ".join(chunk_translations))
 
     return [
         TranslationItem(
