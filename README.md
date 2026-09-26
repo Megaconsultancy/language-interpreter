@@ -34,9 +34,35 @@ The easiest way to run the API is using Docker Compose. The `Dockerfile` is conf
 
 Once the API is running on port 8000, you can test it by sending a `POST` request to the `/translate` endpoint. 
 
-You must provide a JSON body with the `text` you want to translate, and the target `lang` (`bem` for Bemba, or `nya` for Chewa/Nyanja).
+The endpoint accepts `text` as either a **single string** or an **array of strings** for batching, and **always returns an array** of translation objects. You can also optionally specify `src_lang` (defaults to `bem` if target is `eng`, or `eng` if target is `bem`/`nya`).
 
-### Example: Translating to Bemba
+### Example 1: Batch Translating Bemba to English
+
+```bash
+curl -X POST "http://localhost:8000/translate" \
+     -H "Content-Type: application/json" \
+     -d '{"text": ["Muli shani", "Natotela"], "lang": "eng", "src_lang": "bem"}'
+```
+
+**Response:**
+```json
+[
+  {
+    "original": "Muli shani",
+    "translation": "How are you?",
+    "source_lang": "bem",
+    "target_lang": "eng"
+  },
+  {
+    "original": "Natotela",
+    "translation": "Thank you",
+    "source_lang": "bem",
+    "target_lang": "eng"
+  }
+]
+```
+
+### Example 2: Translating Single or Multiple English Sentences to Bemba
 
 ```bash
 curl -X POST "http://localhost:8000/translate" \
@@ -46,28 +72,14 @@ curl -X POST "http://localhost:8000/translate" \
 
 **Response:**
 ```json
-{
-  "original": "Where is the closest hospital?",
-  "translation": "Bushe cipatala icapalamishe caba kwi?",
-  "lang": "bem"
-}
-```
-
-### Example: Translating to Chewa (Nyanja)
-
-```bash
-curl -X POST "http://localhost:8000/translate" \
-     -H "Content-Type: application/json" \
-     -d '{"text": "Where is the closest hospital?", "lang": "nya"}'
-```
-
-**Response:**
-```json
-{
-  "original": "Where is the closest hospital?",
-  "translation": "Kodi chipatala chapafupi chili kuti?",
-  "lang": "nya"
-}
+[
+  {
+    "original": "Where is the closest hospital?",
+    "translation": "Bushe cipatala icapalamishe caba kwi?",
+    "source_lang": "eng",
+    "target_lang": "bem"
+  }
+]
 ```
 
 ## Running Locally (Without Docker)
