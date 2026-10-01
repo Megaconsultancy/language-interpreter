@@ -6,11 +6,15 @@ import uvicorn
 from contextlib import asynccontextmanager
 import asyncio
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import torch
 
 # Global variables to hold the model and tokenizer in memory
 tokenizer = None
 model = None
-translation_lock = asyncio.Lock()
+translation_lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=1)
 
 # NLLB hard token limit is 512; we stay comfortably below it
 MAX_INPUT_TOKENS = 480
@@ -23,7 +27,12 @@ def chunk_text(text: str, src_lang_code: str) -> list[str]:
     nothing gets silently truncated by the tokeniser's hard 512-token limit.
     """
     # Split on sentence-ending punctuation followed by whitespace
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    # Fast path: short texts (< 1200 chars) are safely under the 480-token limit
+    stripped = text.strip()
+    if len(stripped) < 1200:
+        return [stripped] if stripped else [text]
+
+    sentences = re.split(r'(?<=[.!?])\s+', stripped)
     sentences = [s.strip() for s in sentences if s.strip()]
 
     chunks: list[str] = []
@@ -103,6 +112,60 @@ class TranslationItem(BaseModel):
     source_lang: str
     target_lang: str
 
+def _run_inference(texts: list[str], source_code: str, target_code: str) -> list[str]:
+    """Run translation inference in a worker thread, off the async event loop."""
+    with translation_lock:
+        tokenizer.src_lang = source_code
+
+        # 1. Chunk every text item and track how many chunks each produced
+        item_chunk_counts: list[int] = []
+        all_chunks: list[str] = []
+
+        for text_item in texts:
+            chunks = chunk_text(text_item, source_code)
+            item_chunk_counts.append(len(chunks))
+            all_chunks.extend(chunks)
+
+        # 2. Batch all chunks across ALL items together (true batching)
+        BATCH_SIZE = 8
+        all_chunk_translations: list[str] = []
+
+        with torch.inference_mode():
+            for i in range(0, len(all_chunks), BATCH_SIZE):
+                batch = all_chunks[i : i + BATCH_SIZE]
+                inputs = tokenizer(
+                    batch,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                )
+
+                # Scale max decode length to input size to avoid runaway decoding
+                input_len = inputs["input_ids"].shape[1]
+                dynamic_max_tokens = min(256, max(32, int(input_len * 1.5)))
+
+                translated_tokens = model.generate(
+                    **inputs,
+                    forced_bos_token_id=tokenizer.convert_tokens_to_ids(target_code),
+                    max_new_tokens=dynamic_max_tokens,
+                    num_beams=1,
+                )
+
+                all_chunk_translations.extend(
+                    tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
+                )
+
+        # 3. Reconstruct translations per original text item
+        results: list[str] = []
+        cursor = 0
+        for count in item_chunk_counts:
+            results.append(" ".join(all_chunk_translations[cursor : cursor + count]))
+            cursor += count
+
+        return results
+
+
 @app.post("/translate", response_model=List[TranslationItem])
 async def translate_text(request: TranslationRequest):
     # Normalize input into a list of strings
@@ -142,40 +205,11 @@ async def translate_text(request: TranslationRequest):
             source_code = "eng_Latn"
             resolved_src = "eng"
 
-    async with translation_lock:
-        tokenizer.src_lang = source_code
-
-        # Batch in chunks of 32 to maintain speed and manage memory
-        BATCH_SIZE = 32
-        all_translations = []
-
-        for text_item in texts:
-            # Split into token-safe chunks so nothing is silently truncated
-            text_chunks = chunk_text(text_item, source_code)
-            chunk_translations: list[str] = []
-
-            for i in range(0, len(text_chunks), BATCH_SIZE):
-                batch = text_chunks[i : i + BATCH_SIZE]
-                inputs = tokenizer(
-                    batch,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=512,
-                )
-
-                translated_tokens = model.generate(
-                    **inputs,
-                    forced_bos_token_id=tokenizer.convert_tokens_to_ids(target_code),
-                    max_new_tokens=512,
-                )
-
-                chunk_translations.extend(
-                    tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)
-                )
-
-            # Re-join chunk translations into one string per original text
-            all_translations.append(" ".join(chunk_translations))
+    # Offload CPU-bound inference to a worker thread so the event loop stays responsive
+    loop = asyncio.get_running_loop()
+    all_translations = await loop.run_in_executor(
+        executor, _run_inference, texts, source_code, target_code
+    )
 
     return [
         TranslationItem(
